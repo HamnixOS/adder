@@ -46,6 +46,7 @@ TESTS=(
     "unsigned_divshift:bash scripts/test_compiler_unsigned_divshift.sh"
     "module_private:bash scripts/test_compiler_module_private.sh"
     "class_inheritance:bash scripts/test_compiler_class_inheritance.sh"
+    "methods:bash scripts/test_compiler_methods.sh"
     "unsupported_rejected:bash scripts/test_compiler_unsupported_rejected.sh"
 )
 

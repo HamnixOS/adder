@@ -128,14 +128,6 @@ def main() -> int32:
 def main() -> int32:
     return 0
 "
-"class_method_call|class Foo:
-    x: int32
-    def m(self) -> int32:
-        return self.x
-def main() -> int32:
-    f: Foo
-    return f.m()
-"
 "list_type|def main() -> int32:
     xs: List[int32] = cast[List[int32]](0)
     return 0
