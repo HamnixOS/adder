@@ -631,32 +631,41 @@ ptr: Ptr[int32] = &x         # Address of local x
 val: int32 = *ptr            # Dereference (returns int32)
 ```
 
-### Pointer arithmetic is UN-scaled — it's byte arithmetic
+### Pointer arithmetic is element-scaled (C semantics)
 
-Unlike C, `Ptr[T] + N` does **not** scale by `sizeof(T)`. The codegen
-emits a plain `addq` of the raw integer to the pointer value, so
-`ptr + 1` advances by **1 byte**, not by `sizeof(T)` bytes. To advance
-by elements, multiply manually OR use the index form below.
+`Ptr[T] + N` scales by `sizeof(T)`, matching C and Rust: `ptr + 1`
+advances by **`sizeof(T)` bytes**, not by 1 byte. `Ptr[T] - N` scales
+the same way. The integer side is the side that gets multiplied;
+codegen emits a `shlq` (or `imulq` for odd struct sizes) followed by
+the `addq` / `subq`.
 
 ```python
 ptr: Ptr[int32] = &x
-ptr_plus_1_byte: Ptr[int32] = ptr + 1         # +1 byte (NOT +4)
-ptr_next_elem:   Ptr[int32] = ptr + 4         # spell out the byte offset
+ptr_next_elem: Ptr[int32] = ptr + 1           # +4 bytes (sizeof(int32))
+
+q: Ptr[uint64] = ...
+q_back_2:      Ptr[uint64] = q - 2            # -16 bytes (2 * sizeof(uint64))
 ```
 
-The idiomatic production pattern is to compute the byte offset in
-`uint64` space and cast at the end (see `linux_abi/api_e1000e.ad`,
-`linux_abi/api_pci.ad`):
+**Exception — 1-byte pointees stay byte-wise.** `Ptr[uint8]`,
+`Ptr[int8]`, and `Ptr[char]` use plain byte arithmetic (no scale).
+This is what makes the kernel's `cast[Ptr[uint8]]` byte-offset idiom
+keep working:
 
 ```python
 head_p: Ptr[uint64] = cast[Ptr[uint64]](skb + 0xc8)
 ts_p:   Ptr[uint32] = cast[Ptr[uint32]](skb + 0xd8)
+buf:    Ptr[uint8]  = cast[Ptr[uint8]](raw)
+buf_x:  Ptr[uint8]  = buf + 16                 # +16 bytes (1-byte pointee)
 ```
 
-TODO(adder): the natural C semantics would be element-scaled
-arithmetic; the un-scaled behaviour above is an implementation
-limitation, not a deliberate design. A future codegen pass should
-scale `Ptr[T] + N` by `sizeof(T)` and update all production callers.
+The `skb + 0xc8` form above is plain `uint64 + uint64` (NOT pointer
+arithmetic — `skb` is a `uint64`), so it stays byte-wise regardless.
+The scaling only applies when the static type of an operand is `Ptr[T]`
+with `sizeof(T) > 1`.
+
+`Ptr[T] - Ptr[T]` is the raw byte difference (not the element count) —
+the natural lowering, and what existing kernel callers want.
 
 ### Indexing through a pointer
 

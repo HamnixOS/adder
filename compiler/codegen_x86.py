@@ -1973,6 +1973,24 @@ class X86CodeGen:
         self.gen_expr(left)
         self.emit("    popq %rcx")
 
+        # Pointer arithmetic: `Ptr[T] + N` and `Ptr[T] - N` scale the
+        # integer operand by sizeof(T), matching C/Rust semantics. We
+        # SKIP the scaling when sizeof(T) is 1 (uint8/int8/char) — there
+        # byte arithmetic and scaled arithmetic are identical, and the
+        # explicit `cast[uint8]` byte-offset idiom used throughout the
+        # kernel keeps working.
+        # The integer side is `%rcx` if `left` is the pointer, or `%rax`
+        # if `right` is the pointer. Scaling commutes for ADD; for SUB
+        # we only scale when the pointer is on the LEFT (the only
+        # meaningful form — `int - ptr` is nonsense).
+        if op is BinOp.ADD or op is BinOp.SUB:
+            scale = self._pointer_arith_scale(op, left, right)
+            if scale > 1:
+                # Determine which register holds the integer offset.
+                left_scale = self._is_pointer_type(self.get_expr_type(left))
+                int_reg = "%rcx" if left_scale else "%rax"
+                self._emit_scale_reg(int_reg, scale)
+
         match op:
             case BinOp.ADD:
                 self.emit("    addq %rcx, %rax")
@@ -2116,6 +2134,68 @@ class X86CodeGen:
                 "ge": "ae",
             }[signed_cc]
         return signed_cc
+
+    def _is_pointer_type(self, t: Optional[Type]) -> bool:
+        """True if `t` is a pointer-shaped type (Ptr[T]/FnPtr). ArrayType
+        is intentionally NOT included here: array-decay-to-pointer is
+        handled elsewhere and `Array[N, T] + N` is not a documented
+        Adder construct."""
+        return isinstance(t, (PointerType, FunctionPointerType))
+
+    def _pointer_arith_scale(self, op: BinOp, left: Expr, right: Expr) -> int:
+        """Return sizeof(pointee) for a `Ptr[T] +/- N` expression, or 1
+        when no scaling applies (no pointer operand, both operands are
+        pointers, or T is a 1-byte type).
+
+        Skipping the scale on 1-byte pointees is deliberate: byte-offset
+        arithmetic via `cast[Ptr[uint8]]` is the long-standing kernel
+        idiom (see linux_abi/api_*.ad), and scaled vs unscaled produce
+        the same machine code when the unit is one byte.
+        """
+        lt = self.get_expr_type(left)
+        rt = self.get_expr_type(right)
+        l_ptr = self._is_pointer_type(lt)
+        r_ptr = self._is_pointer_type(rt)
+        if l_ptr and r_ptr:
+            # `ptr - ptr` is a byte difference (the natural lowering);
+            # `ptr + ptr` is meaningless but we leave the codegen alone.
+            return 1
+        if op is BinOp.SUB and r_ptr and not l_ptr:
+            # `int - ptr` is nonsense; don't try to scale.
+            return 1
+        ptr_t: Optional[Type] = None
+        if l_ptr:
+            ptr_t = lt
+        elif r_ptr:
+            ptr_t = rt
+        if ptr_t is None:
+            return 1
+        # Pull the pointee. FunctionPointerType has no `base_type` — the
+        # pointee of a function pointer is a function, not a value, so
+        # `fnptr + N` byte offsets don't have a meaningful element scale
+        # either — leave it unscaled.
+        if isinstance(ptr_t, FunctionPointerType):
+            return 1
+        assert isinstance(ptr_t, PointerType)
+        elem_size = self.get_type_size(ptr_t.base_type)
+        if elem_size <= 1:
+            return 1
+        return elem_size
+
+    def _emit_scale_reg(self, reg: str, scale: int) -> None:
+        """Multiply `reg` by `scale` in-place. Prefers shifts for the
+        power-of-two cases (1/2/4/8 bytes — int16/int32/int64/Ptr) and
+        falls back to imulq for odd struct sizes."""
+        if scale == 1:
+            return
+        if scale == 2:
+            self.emit(f"    shlq $1, {reg}")
+        elif scale == 4:
+            self.emit(f"    shlq $2, {reg}")
+        elif scale == 8:
+            self.emit(f"    shlq $3, {reg}")
+        else:
+            self.emit(f"    imulq ${scale}, {reg}, {reg}")
 
     def _binop_signed_op(self, left: Expr, right: Expr) -> bool:
         """Decide whether a `>>` / `/` / `%` should use the SIGNED machine
