@@ -269,6 +269,13 @@ class X86CodeGen:
         self.percpu_offsets: dict[str, int] = {}
         self.percpu_size: int = 0
         self.structs: dict[str, StructInfo] = {}
+        # Per-class method tables: class_methods[cls_name][method_name]
+        # = (owner_class_name, FunctionDef). owner is the class that
+        # literally declared the method; for inherited methods it
+        # differs from cls_name. First-match-wins: when a derived class
+        # redefines a parent's method, its FunctionDef replaces the
+        # parent's. Built in _collect_class_methods.
+        self.class_methods: dict[str, dict[str, tuple[str, "FunctionDef"]]] = {}
         self.ctx: Optional[FunctionContext] = None
         # Bare-metal target compiles a standalone kernel ELF: skip
         # kbuild-specific bits like the .modinfo license stamp that modpost
@@ -554,6 +561,13 @@ class X86CodeGen:
         for decl in program.declarations:
             if isinstance(decl, ClassDef):
                 self.layout_struct(decl, program)
+        # Build the per-class method table BEFORE Pass-1 symbol
+        # registration so the registration loop can register each
+        # method's mangled symbol (`Class__method`) as a defined
+        # function — `MethodCallExpr` lowers to a direct call against
+        # that symbol, and `gen_call`'s direct-call classification
+        # consults `defined_funcs`.
+        self._collect_class_methods(program)
         for decl in program.declarations:
             match decl:
                 case ExternDecl(name=name):
@@ -564,6 +578,21 @@ class X86CodeGen:
                     self.defined_funcs.add(name)
                     if decl.return_type is not None:
                         self.func_return_types[name] = decl.return_type
+                case ClassDef():
+                    # Register each method's mangled symbol + return type.
+                    # Methods inherited via first-match flattening are
+                    # registered against the class that DECLARES them
+                    # (which is the call-site's lookup answer), so we
+                    # walk the resolved table not the literal decl list.
+                    for mname, (owner, mdef) in self.class_methods[
+                            decl.name].items():
+                        # The owner-class symbol is emitted at owner's
+                        # ClassDef pass below; here we just record the
+                        # mangled name for direct-call routing.
+                        sym = self._method_symbol(owner, mname)
+                        self.defined_funcs.add(sym)
+                        if mdef.return_type is not None:
+                            self.func_return_types[sym] = mdef.return_type
                 case VarDecl(name=name, var_type=var_type):
                     self.global_var_types[name] = var_type
                     if isinstance(var_type, PercpuType):
@@ -590,7 +619,13 @@ class X86CodeGen:
                 case VarDecl():
                     pass  # emitted in the .data/.bss pass below
                 case ClassDef():
-                    pass  # layout only, no code
+                    # Emit each method as a free function named
+                    # `<ClassName>__<methodName>`. Inherited methods are
+                    # NOT re-emitted here — they're already emitted under
+                    # their owner class. Only methods this class
+                    # literally declared get an emission.
+                    for m in decl.methods:
+                        self.gen_method(decl, m)
                 case _:
                     raise CodeGenError(
                         f"x86: top-level {type(decl).__name__} not yet supported"
@@ -601,6 +636,107 @@ class X86CodeGen:
         if not self.bare_metal:
             self.gen_modinfo()
         return "\n".join(self.output) + "\n"
+
+    # -- method name mangling + table building ------------------------------
+
+    @staticmethod
+    def _method_symbol(class_name: str, method_name: str) -> str:
+        """`Class__method` is the mangled symbol name for a class method.
+
+        Double-underscore matches the C++ Itanium ABI's parent::child
+        joiner, which is forbidden in normal identifiers (the lexer
+        rejects user identifiers containing `__` if it chooses to —
+        currently it doesn't, but the rule remains: agents should not
+        name a free function with `Class__method` shape). Method
+        emission, indirect-call routing through .text, and external
+        symbol naming all use this exact string.
+        """
+        return f"{class_name}__{method_name}"
+
+    def _collect_class_methods(
+        self, program: Program
+    ) -> None:
+        """Build self.class_methods: the resolved per-class method
+        table.
+
+        Methods are inherited via the same flattening rule as fields:
+        walk the bases left-to-right depth-first and add each base's
+        methods, with first-match-wins on name. The child's own
+        methods OVERRIDE inherited names (this is the only form of
+        overriding in Adder — there's no vtable, no virtual dispatch,
+        the override is resolved at compile time so the call site
+        emits a direct `call <derived-class>__<method>`).
+
+        The (owner_class_name, FunctionDef) tuple records WHICH class
+        declared the method — call-site lowering uses owner to mangle
+        the symbol name. For an inherited method this means a derived
+        class's `obj.method()` lowers to `BaseClass__method(&obj)`,
+        not `DerivedClass__method` — that's correct because Adder's
+        inheritance is field-flattening at offset 0 and the base
+        method only references base-class fields, so `Ptr[Derived]`
+        is bit-identical to `Ptr[Base]` at offset 0.
+        """
+        # First pass: index ClassDefs by name for lookup.
+        classes: dict[str, ClassDef] = {}
+        for decl in program.declarations:
+            if isinstance(decl, ClassDef):
+                classes[decl.name] = decl
+
+        # Topological-ish walk: resolving a class's methods requires
+        # its bases' tables to be ready. Recurse and memoise.
+        def resolve(name: str) -> dict[str, tuple[str, FunctionDef]]:
+            if name in self.class_methods:
+                return self.class_methods[name]
+            cls = classes.get(name)
+            if cls is None:
+                # Unknown class — already flagged by layout_struct's
+                # base resolution. Return empty; codegen aborts before
+                # this matters.
+                return {}
+            table: dict[str, tuple[str, FunctionDef]] = {}
+            for base in cls.bases:
+                # Bases listed left-to-right; later bases shadow
+                # earlier ones (Python MRO semantics flattened).
+                for mname, ent in resolve(base).items():
+                    table[mname] = ent
+            # Class's own methods override inherited ones (first-match
+            # wins from the perspective of the resolved table the
+            # CHILD exposes).
+            for m in cls.methods:
+                table[m.name] = (cls.name, m)
+            self.class_methods[name] = table
+            return table
+
+        for cls_name in classes:
+            resolve(cls_name)
+
+    def gen_method(self, cls: ClassDef, m: "FunctionDef") -> None:
+        """Emit a class method as a free function `Class__method`.
+
+        The method body is a plain function body — the only special
+        thing is that its first parameter is `self: Ptr[Class]`,
+        synthesised by the parser, and references to `self.field`
+        inside the body resolve via `gen_member_address`'s
+        pointer-aware path (see `_obj_is_pointer`).
+        """
+        sym = self._method_symbol(cls.name, m.name)
+        # gen_function reads func.name to label the symbol. We don't
+        # want to mutate the AST node (would affect later passes /
+        # debug reps), so emit through a shallow copy with the mangled
+        # name.
+        from .ast_nodes import FunctionDef as _FunctionDef
+        mangled = _FunctionDef(
+            name=sym,
+            params=m.params,
+            return_type=m.return_type,
+            body=m.body,
+            decorators=m.decorators,
+            type_params=m.type_params,
+            span=m.span,
+            module=m.module,
+            orig_name=m.orig_name or m.name,
+        )
+        self.gen_function(mangled)
 
     def layout_struct(self, cls: ClassDef,
                       program: Optional[Program] = None) -> None:
@@ -702,14 +838,6 @@ class X86CodeGen:
         """
         for decl in program.declarations:
             if isinstance(decl, ClassDef):
-                if decl.methods:
-                    m = decl.methods[0]
-                    raise CodeGenError(
-                        f"x86: methods in class body are not supported "
-                        f"(class '{decl.name}', method '{m.name}' at "
-                        f"{_span_location(m.span)}); rewrite as a free "
-                        f"function with a Ptr[{decl.name}] first arg"
-                    )
                 if decl.decorators:
                     raise CodeGenError(
                         f"x86: decorators are not supported "
@@ -721,6 +849,41 @@ class X86CodeGen:
                     _reject_unsupported_type(
                         f.field_type,
                         f"class '{decl.name}' field '{f.name}'",
+                    )
+                # Methods: validated like free functions. Default
+                # params and decorators on methods are still rejected
+                # (no decorator semantics; default values silently
+                # corrupt arg regs). `self` was synthesised by the
+                # parser as Parameter(name='self', type=Ptr[Class]) —
+                # it has no default and a known type, so this loop
+                # accepts it transparently.
+                for m in decl.methods:
+                    if m.decorators:
+                        raise CodeGenError(
+                            f"x86: decorators are not supported "
+                            f"(method '{decl.name}.{m.name}', got "
+                            f"@{m.decorators[0]} at "
+                            f"{_span_location(m.span)})"
+                        )
+                    for p in m.params:
+                        if p.default is not None:
+                            raise CodeGenError(
+                                f"x86: default-valued parameters are not "
+                                f"supported (method '{decl.name}.{m.name}', "
+                                f"parameter '{p.name}' at "
+                                f"{_span_location(p.span)})"
+                            )
+                        _reject_unsupported_type(
+                            p.param_type,
+                            f"method '{decl.name}.{m.name}' "
+                            f"parameter '{p.name}'",
+                        )
+                    _reject_unsupported_type(
+                        m.return_type,
+                        f"method '{decl.name}.{m.name}' return type",
+                    )
+                    self._validate_stmts_supported(
+                        m.body, f"method '{decl.name}.{m.name}'"
                     )
             elif isinstance(decl, FunctionDef):
                 if decl.decorators:
@@ -1597,19 +1760,10 @@ class X86CodeGen:
                     self.emit(f"    subq ${off}, %rax")
 
             case _:
-                # MethodCallExpr deserves an actionable diagnostic: the
-                # silent-class-method-drop bug (audit 10d6f7c) is now
-                # rejected at class-def time, but a stray `obj.m()` with
-                # no class declaration in scope still routes here.
                 from .ast_nodes import MethodCallExpr as _MethodCallExpr
                 if isinstance(expr, _MethodCallExpr):
-                    span = getattr(expr, "span", None)
-                    raise CodeGenError(
-                        f"x86: method calls (`obj.{expr.method}(...)`) "
-                        f"are not supported at {_span_location(span)}; "
-                        f"call as a free function: "
-                        f"{expr.method}(&obj, ...)"
-                    )
+                    self.gen_method_call(expr)
+                    return
                 raise CodeGenError(
                     f"x86: expression {type(expr).__name__} not yet supported"
                 )
@@ -1975,14 +2129,37 @@ class X86CodeGen:
         self.emit_load_sized(size, "%rax", "%rax")
 
     def _resolve_struct(self, obj: Expr) -> StructInfo:
-        """Return the StructInfo for `obj`'s type, raising if unknown."""
+        """Return the StructInfo for `obj`'s type, raising if unknown.
+
+        A `Ptr[Foo]`-typed expression is treated as a pointer to `Foo`
+        — `gen_member_address` does the value-load instead of the
+        address-of, so `self.x` (with `self: Ptr[Foo]`) lowers
+        identically to the production `self_ptr[0].x` idiom. This is
+        what makes method bodies' `self.field` work.
+        """
         t = self.get_expr_type(obj)
         if t is not None and hasattr(t, "name") and t.name in self.structs:
             return self.structs[t.name]
+        if isinstance(t, PointerType):
+            base = t.base_type
+            if base is not None and hasattr(base, "name") \
+                    and base.name in self.structs:
+                return self.structs[base.name]
         raise CodeGenError(
             f"x86: cannot access member — type of {type(obj).__name__} "
             f"is not a known struct"
         )
+
+    def _obj_is_pointer(self, obj: Expr) -> bool:
+        """True if `obj` evaluates to a Ptr[Struct] value (vs an
+        in-place struct value). Member access through a pointer needs
+        the pointer's VALUE in %rax, not its address."""
+        t = self.get_expr_type(obj)
+        if isinstance(t, PointerType):
+            base = t.base_type
+            return (base is not None and hasattr(base, "name")
+                    and base.name in self.structs)
+        return False
 
     def _field_size(self, obj: Expr, member: str) -> int:
         si = self._resolve_struct(obj)
@@ -1992,7 +2169,14 @@ class X86CodeGen:
         raise CodeGenError(f"x86: struct '{si.name}' has no field '{member}'")
 
     def gen_member_address(self, obj: Expr, member: str) -> None:
-        """Leave the address of obj.member in %rax."""
+        """Leave the address of obj.member in %rax.
+
+        For an in-place struct value (local/global/array elem) we
+        compute &obj + field_offset. For a pointer-to-struct value
+        (`Ptr[Foo]`-typed expression) we LOAD the pointer's value and
+        add the field offset — this is what makes `self.field` work
+        inside method bodies (`self: Ptr[Foo]`).
+        """
         si = self._resolve_struct(obj)
         field_offset: Optional[int] = None
         for fname, _, off in si.fields:
@@ -2003,7 +2187,10 @@ class X86CodeGen:
             raise CodeGenError(
                 f"x86: struct '{si.name}' has no field '{member}'"
             )
-        self.gen_addr_of(obj)
+        if self._obj_is_pointer(obj):
+            self.gen_expr(obj)
+        else:
+            self.gen_addr_of(obj)
         if field_offset:
             self.emit(f"    addq ${field_offset}, %rax")
 
@@ -2130,6 +2317,78 @@ class X86CodeGen:
         # Reclaim the 16-byte function-pointer stash (indirect calls only).
         if target_pushed:
             self.emit("    addq $16, %rsp")
+
+    def gen_method_call(self, mc) -> None:
+        """Lower `obj.method(args)` to a direct call against the
+        mangled `<OwnerClass>__<method>` symbol, passing `&obj` (or
+        `obj` if it's already a Ptr[Class]) as the first arg.
+
+        Owner resolution: look up `obj`'s class in self.class_methods
+        and find the (owner, FunctionDef) for `mc.method`. Inheritance
+        means owner may be a base class of obj's class — that's fine
+        because Adder's field-flattening puts base fields at offset 0,
+        so a `Ptr[Derived]` is bit-identical to a `Ptr[Base]` at
+        offset 0.
+        """
+        from .ast_nodes import MethodCallExpr as _MethodCallExpr
+        assert isinstance(mc, _MethodCallExpr)
+
+        # Resolve obj's class name (handle both value-receiver and
+        # pointer-receiver shapes).
+        obj_type = self.get_expr_type(mc.obj)
+        class_name: Optional[str] = None
+        is_ptr_receiver = False
+        if obj_type is not None and hasattr(obj_type, "name") \
+                and obj_type.name in self.structs:
+            class_name = obj_type.name
+        elif isinstance(obj_type, PointerType):
+            base = obj_type.base_type
+            if base is not None and hasattr(base, "name") \
+                    and base.name in self.structs:
+                class_name = base.name
+                is_ptr_receiver = True
+
+        if class_name is None:
+            span = getattr(mc, "span", None)
+            raise CodeGenError(
+                f"x86: method call `.{mc.method}(...)` on a non-class "
+                f"value at {_span_location(span)}; the receiver's type "
+                f"is not a known class"
+            )
+
+        table = self.class_methods.get(class_name)
+        if table is None or mc.method not in table:
+            span = getattr(mc, "span", None)
+            raise CodeGenError(
+                f"x86: class '{class_name}' has no method "
+                f"'{mc.method}' at {_span_location(span)}"
+            )
+        owner, _mdef = table[mc.method]
+        sym = self._method_symbol(owner, mc.method)
+
+        # Build the receiver expression. If obj is a Ptr[Class] the
+        # pointer's value IS the receiver; otherwise we take its
+        # address.
+        from .ast_nodes import (
+            CallExpr as _CallExpr,
+            Identifier as _Identifier,
+            UnaryExpr as _UnaryExpr,
+        )
+        if is_ptr_receiver:
+            receiver = mc.obj
+        else:
+            receiver = _UnaryExpr(UnaryOp.ADDR, mc.obj, getattr(mc, "span", None))
+
+        # Synthesise a CallExpr through the existing direct-call path.
+        # `sym` is in self.defined_funcs (registered in Pass 1) so
+        # gen_call emits a direct `call <sym>`.
+        synth = _CallExpr(
+            _Identifier(sym, getattr(mc, "span", None)),
+            [receiver] + list(mc.args),
+            {},
+            getattr(mc, "span", None),
+        )
+        self.gen_call(synth)
 
     def gen_io_intrinsic(self, name: str, args: list[Expr]) -> None:
         """Emit a bare x86 I/O instruction. No `call`."""
