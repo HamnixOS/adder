@@ -1038,24 +1038,70 @@ class Parser:
 
         return Parameter(name, param_type, default, self.make_span(tok))
 
-    def parse_function(self, decorators: list[str] = None) -> FunctionDef:
-        """Parse a function definition."""
+    def parse_function(self, decorators: list[str] = None,
+                       class_name: Optional[str] = None) -> FunctionDef:
+        """Parse a function definition.
+
+        `class_name` is set when this `def` lives inside a `class Foo:`
+        body — in that case the first parameter MUST be `self`, and we
+        synthesise a `Parameter(name="self", param_type=Ptr[Foo])` so
+        the method body's `self` references resolve like any other
+        parameter (codegen sees a Ptr[Foo] local; method-call lowering
+        passes `&obj` for it).
+
+        For free functions (`class_name is None`) the historical
+        behaviour is preserved: a bare `self` token in the parameter
+        list is consumed and dropped (so legacy free-function code that
+        used `self` as a parameter name still parses; no production
+        site relies on this, but keeping it preserves the additive
+        guarantee).
+        """
         tok = self.current()
         self.expect(TokenType.DEF)
         name = self.expect(TokenType.IDENT).value
 
         self.expect(TokenType.LPAREN)
         params = []
-        if not self.check(TokenType.RPAREN):
-            # Skip 'self' parameter for methods
-            if self.check(TokenType.SELF):
-                self.advance()
-                if self.match(TokenType.COMMA):
-                    pass  # Continue to next param
+        if class_name is not None:
+            # Methods MUST take `self` as their first parameter. Reject
+            # at parse time so the diagnostic points at the method
+            # signature, not the body.
+            if not self.check(TokenType.SELF):
+                raise ParseError(
+                    f"method '{name}' of class '{class_name}' must take "
+                    f"'self' as its first parameter",
+                    self.current(),
+                )
+            self_tok = self.current()
+            self.advance()
+            # Synthesise the self parameter with type Ptr[<class_name>].
+            params.append(Parameter(
+                "self",
+                PointerType(Type(class_name, self.make_span(self_tok)),
+                            self.make_span(self_tok)),
+                None,
+                self.make_span(self_tok),
+            ))
+            if self.match(TokenType.COMMA):
+                pass  # Continue to next param
             if not self.check(TokenType.RPAREN):
                 params.append(self.parse_parameter())
                 while self.match(TokenType.COMMA):
                     params.append(self.parse_parameter())
+        else:
+            if not self.check(TokenType.RPAREN):
+                # Legacy: bare `self` at the front of a free-function
+                # signature is silently dropped (preserves pre-methods
+                # behaviour for the few historical fixtures that wrote
+                # `def f(self):` outside a class).
+                if self.check(TokenType.SELF):
+                    self.advance()
+                    if self.match(TokenType.COMMA):
+                        pass
+                if not self.check(TokenType.RPAREN):
+                    params.append(self.parse_parameter())
+                    while self.match(TokenType.COMMA):
+                        params.append(self.parse_parameter())
         self.expect(TokenType.RPAREN)
 
         return_type = None
@@ -1124,7 +1170,8 @@ class Parser:
 
             # Method (with or without decorators)
             if self.check(TokenType.DEF):
-                method = self.parse_function(method_decorators)
+                method = self.parse_function(method_decorators,
+                                             class_name=name)
                 methods.append(method)
                 continue
 
