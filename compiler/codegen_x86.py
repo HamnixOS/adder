@@ -1504,6 +1504,55 @@ class X86CodeGen:
 
     # -- statements ---------------------------------------------------------
 
+    def _ctor_call_class(self, value: Expr) -> Optional[str]:
+        """If `value` is a `Foo(args)` CallExpr where Foo is a known
+        class with an `__init__` method, return Foo's class name.
+        Otherwise None. Powers the `__init__` constructor sugar:
+        `f: Foo = Foo(args)` and `f = Foo(args)` are intercepted at
+        statement-codegen time and lowered to `Foo__init(&f, args)`
+        instead of trying to assign a struct value (which Adder
+        doesn't support).
+        """
+        if not isinstance(value, CallExpr):
+            return None
+        if not isinstance(value.func, Identifier):
+            return None
+        cname = value.func.name
+        if cname not in self.structs:
+            return None
+        table = self.class_methods.get(cname)
+        if table is None or "__init__" not in table:
+            return None
+        return cname
+
+    def _emit_ctor_init(self, var, cname: str, ctor_call: "CallExpr") -> None:
+        """Emit `Class__init(&local, args)` for a constructor-shaped
+        assignment / VarDecl init. `var` is the LocalVar for the
+        target. The synthesised CallExpr drops through gen_call's
+        direct-call path."""
+        from .ast_nodes import (
+            CallExpr as _CallExpr,
+            Identifier as _Identifier,
+            UnaryExpr as _UnaryExpr,
+        )
+        # &target — synthesised as a unary ADDR on an Identifier with
+        # the local's name (already in ctx.locals at this point).
+        # gen_addr_of follows the existing identifier-local path.
+        span = getattr(ctor_call, "span", None)
+        receiver = _UnaryExpr(
+            UnaryOp.ADDR,
+            _Identifier(var.name, span),
+            span,
+        )
+        sym = self._method_symbol(cname, "__init__")
+        synth = _CallExpr(
+            _Identifier(sym, span),
+            [receiver] + list(ctor_call.args),
+            {},
+            span,
+        )
+        self.gen_call(synth)
+
     def gen_stmt(self, stmt: Stmt) -> None:
         match stmt:
             case ExprStmt(expr=expr):
@@ -1514,18 +1563,35 @@ class X86CodeGen:
                     name, self.get_type_size(var_type), var_type
                 )
                 if value is not None:
-                    self.gen_expr(value)
-                    # Sized store for sub-8-byte scalar locals so the
-                    # slot's byte layout matches what `&local` exposes
-                    # to a callee writing through Ptr[T]. Without this,
-                    # the initialiser's `movq` would dirty the upper
-                    # bytes of the slot, and a callee's sized `movl`
-                    # (or smaller) through the pointer would leave that
-                    # dirt in place — the caller's readback then saw
-                    # 0xFFFFFFFF<low4> instead of just <low4>.
-                    self._emit_local_store(var, "%rax")
+                    # Constructor sugar: `f: Foo = Foo(args)` lowers to
+                    # Foo__init(&f, args) — Adder doesn't have struct
+                    # return values, so we can't go through the normal
+                    # evaluate-then-store path.
+                    cname = self._ctor_call_class(value)
+                    if cname is not None:
+                        self._emit_ctor_init(var, cname, value)
+                    else:
+                        self.gen_expr(value)
+                        # Sized store for sub-8-byte scalar locals so the
+                        # slot's byte layout matches what `&local` exposes
+                        # to a callee writing through Ptr[T]. Without this,
+                        # the initialiser's `movq` would dirty the upper
+                        # bytes of the slot, and a callee's sized `movl`
+                        # (or smaller) through the pointer would leave that
+                        # dirt in place — the caller's readback then saw
+                        # 0xFFFFFFFF<low4> instead of just <low4>.
+                        self._emit_local_store(var, "%rax")
 
             case Assignment(target=target, value=value, op=op):
+                # Constructor sugar: `f = Foo(args)` where Foo is a
+                # class with __init__ lowers to Foo__init(&f, args).
+                if op is None and isinstance(target, Identifier):
+                    cname = self._ctor_call_class(value)
+                    if cname is not None and self.ctx is not None \
+                            and target.name in self.ctx.locals:
+                        var = self.ctx.locals[target.name]
+                        self._emit_ctor_init(var, cname, value)
+                        return
                 self.gen_assignment(target, value, op)
 
             case ReturnStmt(value=value):
