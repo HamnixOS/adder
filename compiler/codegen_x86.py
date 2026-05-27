@@ -1679,6 +1679,30 @@ class X86CodeGen:
             return
 
         if isinstance(target, MemberExpr):
+            # Special-case Percpu[Struct].field store: %gs:-prefixed.
+            info = self._percpu_aggregate_info(target.obj)
+            if info is not None:
+                name, base_offset, base_type = info
+                if base_type is not None and hasattr(base_type, "name") \
+                        and base_type.name in self.structs:
+                    si = self.structs[base_type.name]
+                    for fname, ftype, foff in si.fields:
+                        if fname == target.member:
+                            if isinstance(ftype, ArrayType):
+                                raise CodeGenError(
+                                    f"x86: Percpu[{base_type.name}].{fname} "
+                                    f"is an array — assigning a whole array "
+                                    f"is not a meaningful operation. Use a "
+                                    f"separate Percpu[Array[N, T]] global "
+                                    f"and assign per-element."
+                                )
+                            size = self.get_type_size(ftype)
+                            self.gen_expr(value)
+                            self._emit_gs_store_sized(
+                                size, base_offset + foff, "", "%rax"
+                            )
+                            return
+
             # Compute target field address, save, evaluate value, store sized.
             self.gen_member_address(target.obj, target.member)
             self.emit("    pushq %rax")
@@ -1689,6 +1713,23 @@ class X86CodeGen:
             return
 
         if isinstance(target, IndexExpr):
+            # Special-case Percpu[Array[N, T]] indexed STORE: emit a
+            # `%gs:`-prefixed store. gen_index_address would leaq the
+            # symbol's flat-address copy and lose the per-CPU base.
+            info = self._percpu_aggregate_info(target.obj)
+            if info is not None and isinstance(info[2], ArrayType):
+                name, offset, base = info
+                elem_size = self.get_type_size(base.element_type)
+                # %rcx = index * elem_size; preserve over value-eval.
+                self.gen_expr(target.index)
+                self._emit_scale_reg("%rax", elem_size)
+                self.emit("    pushq %rax")
+                self.gen_expr(value)
+                self.emit("    popq %rcx")
+                # Now %rax holds the value, %rcx the scaled index.
+                self._emit_gs_store_sized(elem_size, offset, "(%rcx)", "%rax")
+                return
+
             # arr[i] = value : compute element address, save, eval value, store
             self.gen_index_address(target)
             self.emit("    pushq %rax")
@@ -2135,6 +2176,34 @@ class X86CodeGen:
             }[signed_cc]
         return signed_cc
 
+    def _percpu_aggregate_info(self, obj: Expr) -> Optional[tuple]:
+        """If `obj` is a bare Identifier naming a Percpu[Array]/Percpu[struct]
+        global, return `(name, offset, base_type)` where `base_type` is the
+        ArrayType / struct Type wrapped by the PercpuType. Else None.
+
+        Used by the indexed-load / store / member-access paths so that
+        accesses to a per-CPU aggregate stay `%gs:`-prefixed instead of
+        decaying to `leaq buf(%rip)` (which would erase the per-CPU base
+        and silently miscompile)."""
+        if not isinstance(obj, Identifier):
+            return None
+        name = obj.name
+        if name not in self.percpu_globals:
+            return None
+        t = self.global_var_types.get(name)
+        if not isinstance(t, PercpuType):
+            return None
+        base = t.base_type
+        is_aggregate = (
+            isinstance(base, ArrayType)
+            or (base is not None and hasattr(base, "name")
+                and base.name in self.structs)
+        )
+        if not is_aggregate:
+            return None
+        offset = self.percpu_offsets[name]
+        return (name, offset, base)
+
     def _is_pointer_type(self, t: Optional[Type]) -> bool:
         """True if `t` is a pointer-shaped type (Ptr[T]/FnPtr). ArrayType
         is intentionally NOT included here: array-decay-to-pointer is
@@ -2271,6 +2340,18 @@ class X86CodeGen:
                 self.emit(f"    leaq {var.offset}(%rbp), %rax")
             elif name in self.defined_funcs or name in self.extern_funcs:
                 self.emit(f"    leaq {name}(%rip), %rax")
+            elif name in self.percpu_globals:
+                # `&percpu_global` (any T) can't be expressed as a single
+                # linear address — the value lives at %gs:offset, which
+                # is a CPU-relative address. leaq can't honour segment
+                # overrides. Reject explicitly so this doesn't silently
+                # decay to `leaq buf(%rip)` and miscompile.
+                raise CodeGenError(
+                    f"x86: cannot take address of Percpu global '{name}' — "
+                    f"the value lives at %gs:offset per CPU, not at a "
+                    f"single linear address. Read/write the value or "
+                    f"index/member-access it directly instead."
+                )
             elif name in self.global_var_types:
                 self.emit(f"    leaq {name}(%rip), %rax")
             else:
@@ -2278,9 +2359,27 @@ class X86CodeGen:
                     f"x86: cannot take address of unknown identifier '{name}'"
                 )
         elif isinstance(operand, IndexExpr):
+            # &percpu_arr[i] would need %gs-relative leaq, not expressible.
+            info = self._percpu_aggregate_info(operand.obj)
+            if info is not None:
+                name, _, _ = info
+                raise CodeGenError(
+                    f"x86: cannot take address of '{name}[i]' — "
+                    f"'{name}' is a Percpu global, lives at %gs:offset "
+                    f"per CPU. Read/write the element directly instead."
+                )
             # &arr[i] : compute base + scaled index, leave in %rax.
             self.gen_index_address(operand)
         elif isinstance(operand, MemberExpr):
+            # &percpu_struct.field would need %gs-relative leaq.
+            info = self._percpu_aggregate_info(operand.obj)
+            if info is not None:
+                name, _, _ = info
+                raise CodeGenError(
+                    f"x86: cannot take address of '{name}.{operand.member}' "
+                    f"— '{name}' is a Percpu global, lives at %gs:offset "
+                    f"per CPU. Read/write the field directly instead."
+                )
             # &obj.field : compute base + field offset, leave in %rax.
             self.gen_member_address(operand.obj, operand.member)
         else:
@@ -2324,9 +2423,70 @@ class X86CodeGen:
 
     def gen_index_load(self, expr: IndexExpr) -> None:
         """Load value at expr.obj[expr.index] into %rax."""
+        # Special-case Percpu[Array[N, T]] indexing: emit a `%gs:`-prefixed
+        # load using disp(%rcx) addressing so the per-CPU base is honoured.
+        # Falling through to gen_index_address would `leaq buf(%rip)` and
+        # silently lose the per-CPU offset.
+        info = self._percpu_aggregate_info(expr.obj)
+        if info is not None and isinstance(info[2], ArrayType):
+            name, offset, base = info
+            elem_size = self.get_type_size(base.element_type)
+            # %rcx = index * elem_size
+            self.gen_expr(expr.index)
+            self.emit("    movq %rax, %rcx")
+            self._emit_scale_reg("%rcx", elem_size)
+            self._emit_gs_load_sized(elem_size, offset, "(%rcx)", "%rax")
+            return
         self.gen_index_address(expr)
         size = self.element_size_of(expr.obj)
         self.emit_load_sized(size, "%rax", "%rax")
+
+    def _emit_gs_load_sized(self, size: int, disp: int, addr_suffix: str,
+                            dst: str) -> None:
+        """Emit a `%gs:disp+addr_suffix -> dst` load of `size` bytes.
+
+        `addr_suffix` is the extra address term after the displacement
+        (e.g. "(%rcx)" for SIB-less, or "" for a literal disp). The
+        full operand is `%gs:disp{addr_suffix}`. Loads zero-extend into
+        the 64-bit destination, matching the non-segment helpers."""
+        operand = f"%gs:{disp}{addr_suffix}"
+        if size == 8:
+            self.emit(f"    movq {operand}, {dst}")
+        elif size == 4:
+            dst32 = dst.replace("%r", "%e") if dst.startswith("%r") else dst
+            self.emit(f"    movl {operand}, {dst32}")
+        elif size == 2:
+            self.emit(f"    movzwq {operand}, {dst}")
+        elif size == 1:
+            self.emit(f"    movzbq {operand}, {dst}")
+        else:
+            raise CodeGenError(
+                f"x86: Percpu aggregate element size {size} not supported"
+            )
+
+    def _emit_gs_store_sized(self, size: int, disp: int, addr_suffix: str,
+                             src: str) -> None:
+        """Emit a `src -> %gs:disp+addr_suffix` store of `size` bytes.
+
+        See _emit_gs_load_sized for the addressing convention."""
+        low = {
+            "%rax": ("%al", "%ax", "%eax"),
+            "%rcx": ("%cl", "%cx", "%ecx"),
+            "%rdx": ("%dl", "%dx", "%edx"),
+        }[src]
+        operand = f"%gs:{disp}{addr_suffix}"
+        if size == 8:
+            self.emit(f"    movq {src}, {operand}")
+        elif size == 4:
+            self.emit(f"    movl {low[2]}, {operand}")
+        elif size == 2:
+            self.emit(f"    movw {low[1]}, {operand}")
+        elif size == 1:
+            self.emit(f"    movb {low[0]}, {operand}")
+        else:
+            raise CodeGenError(
+                f"x86: Percpu aggregate element size {size} not supported"
+            )
 
     def _resolve_struct(self, obj: Expr) -> StructInfo:
         """Return the StructInfo for `obj`'s type, raising if unknown.
@@ -2398,6 +2558,30 @@ class X86CodeGen:
         """Load the value of expr.obj.expr.member into %rax. For array fields
         the result is the field's ADDRESS (mirroring how Identifier of an
         array yields its address, not its 16-byte contents)."""
+        # Special-case Percpu[Struct] field load: emit a `%gs:`-prefixed
+        # load directly. The default path leaqs the flat-address copy
+        # of the symbol and loses the per-CPU base.
+        info = self._percpu_aggregate_info(expr.obj)
+        if info is not None:
+            name, base_offset, base_type = info
+            if base_type is not None and hasattr(base_type, "name") \
+                    and base_type.name in self.structs:
+                si = self.structs[base_type.name]
+                for fname, ftype, foff in si.fields:
+                    if fname == expr.member:
+                        if isinstance(ftype, ArrayType):
+                            raise CodeGenError(
+                                f"x86: Percpu[{base_type.name}].{fname} is "
+                                f"an array — taking its address would need "
+                                f"%gs-relative leaq which x86 can't form. "
+                                f"Index/store individual elements via a "
+                                f"separate Percpu[Array[N, T]] global."
+                            )
+                        size = self.get_type_size(ftype)
+                        self._emit_gs_load_sized(
+                            size, base_offset + foff, "", "%rax"
+                        )
+                        return
         self.gen_member_address(expr.obj, expr.member)
         si = self._resolve_struct(expr.obj)
         for fname, ftype, _ in si.fields:

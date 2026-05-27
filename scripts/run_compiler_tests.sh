@@ -47,6 +47,8 @@ TESTS=(
     "module_private:bash scripts/test_compiler_module_private.sh"
     "class_inheritance:bash scripts/test_compiler_class_inheritance.sh"
     "methods:bash scripts/test_compiler_methods.sh"
+    "ptr_arith_scaled:bash scripts/test_compiler_ptr_arith_scaled.sh"
+    "percpu_aggregate:bash scripts/test_compiler_percpu_aggregate.sh"
     "unsupported_rejected:bash scripts/test_compiler_unsupported_rejected.sh"
 )
 

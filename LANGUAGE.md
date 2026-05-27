@@ -773,15 +773,47 @@ or writing a `Percpu[T]` global from inside an Adder function emits
 the `%gs:`-prefixed `movq`/`movl`/etc. directly — no helper call,
 no relocation surprises.
 
-`T` must be a scalar (1/2/4/8 bytes). Scalar reads/writes use a
-sized `%gs:offset` `movb/movw/movl/movq`. Aggregate types
-(`Percpu[Array[N, T]]`, `Percpu[SomeStruct]`) have NO working
-accessor: a direct scalar load/store would error at codegen, but
-indexing through an aggregate Percpu global (`buf[0]`) silently
-decays to a plain `leaq buf(%rip)` and the per-CPU base is LOST.
-Keep `Percpu[T]` to scalar types until that path is wired up.
-TODO(adder): `Percpu[Array[N, T]]` / `Percpu[Struct]` aggregates
-should reject at codegen the same way the scalar accessor does.
+Both scalar `Percpu[T]` and aggregate Percpu globals
+(`Percpu[Array[N, T]]`, `Percpu[SomeStruct]`) lower to `%gs:`-prefixed
+loads/stores:
+
+```python
+# Scalar — direct load/store.
+cpu_id_pcpu: Percpu[uint64]
+def whoami() -> uint64:
+    return cpu_id_pcpu               # movq %gs:offset, %rax
+
+# Aggregate array — indexed load/store. The element size sets the
+# scale and the load/store mnemonic.
+hist: Percpu[Array[8, uint32]]
+def bump(slot: uint64):
+    v: uint32 = hist[slot]           # movl %gs:disp(%rcx), %eax
+    hist[slot] = v + 1               # movl %eax, %gs:disp(%rcx)
+
+# Aggregate struct — member load/store, literal disp.
+class Counters:
+    hits:   uint64
+    misses: uint32
+    flag:   uint8
+
+stats: Percpu[Counters]
+def on_hit():
+    stats.hits = stats.hits + 1      # movq %gs:disp, %rax / movq %rax, %gs:disp
+```
+
+`T` (or each scalar field) must be a 1/2/4/8-byte type — there is no
+multi-register Percpu transfer. Sub-aggregate fields of struct type
+(`Percpu[Outer]` where `Outer.inner: SomeStruct`) and array-typed
+struct fields are intentionally not supported; flatten the layout or
+use a separate Percpu global.
+
+**Taking the address of a Percpu global is rejected at codegen.**
+`&percpu_x`, `&percpu_arr[i]`, and `&percpu_struct.field` would need a
+`%gs`-relative `leaq` which x86 cannot express in a single
+instruction; the codegen raises an explicit error rather than emitting
+a flat `leaq buf(%rip)` that would silently drop the per-CPU base.
+Read/write the value (or the indexed/member-accessed slot) directly
+instead.
 
 ---
 
