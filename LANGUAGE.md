@@ -39,7 +39,7 @@ it; if a Python feature you'd expect is missing, it's deliberate (see
 - [Functions](#functions)
 - [Function Pointers](#function-pointers)
 - [Control Flow](#control-flow)
-- [Classes (used as structs)](#classes-used-as-structs)
+- [Classes (structs with optional static methods)](#classes-structs-with-optional-static-methods)
 - [Pointers and Memory](#pointers-and-memory)
 - [Type Casting](#type-casting)
 - [Heap Allocation](#heap-allocation)
@@ -442,17 +442,21 @@ while i < n:
 
 ---
 
-## Classes (used as structs)
+## Classes (structs with optional static methods)
 
 A `class` in Adder is a **C-ABI-compatible struct**. Fields are laid
 out in declaration order, each aligned to its natural alignment
-(capped at 8), and the total size is rounded up to 8 bytes. There are
-**no methods, no constructors, and no destructors** — classes carry
-data, not behaviour. Single and multi-base **inheritance is supported
-purely as field flattening**: `class Dog(Animal):` prepends each base
-class's fields (recursively) before the child's, in declaration order.
-No vtable, no virtual dispatch — `d.legs` on a `Dog(Animal)` resolves
-to the same byte offset as `a.legs` on a bare `Animal`. A child that
+(capped at 8), and the total size is rounded up to 8 bytes. Classes
+also carry **optional static methods** (no vtable, no virtual
+dispatch, no RAII, no destructors — see *Static methods, auto-self,
+name mangling* below) and **optional `__init__` sugar** for
+stack-allocated constructors.
+
+Single and multi-base **inheritance is supported purely as field
+flattening**: `class Dog(Animal):` prepends each base class's fields
+(recursively) before the child's, in declaration order. No vtable,
+no virtual dispatch — `d.legs` on a `Dog(Animal)` resolves to the
+same byte offset as `a.legs` on a bare `Animal`. A child that
 redeclares an inherited field name is a compile error (the codegen
 has no override slot to redirect to).
 
@@ -514,6 +518,106 @@ recursively in left-to-right, depth-first order. There is **no
 vtable, no virtual dispatch, no upcast pointer** — the inheritance is
 purely a layout convenience so common headers stay in one place.
 Redeclaring an inherited field name in the child is a compile error.
+
+### Static methods, auto-self, name mangling
+
+A class body may contain `def` methods. They MUST take `self` as
+their first parameter; the parser synthesises `self: Ptr[<ClassName>]`
+automatically. The compiler emits each method as a free function
+named `<ClassName>__<methodName>` (double-underscore joiner), and
+rewrites the call site `obj.method(args)` to a direct call against
+that mangled symbol with `&obj` (or `obj`, if it's already
+`Ptr[<ClassName>]`) prepended as the first argument.
+
+```python
+class Foo:
+    x: int32
+    y: int32
+
+    def sum(self) -> int32:
+        return self.x + self.y
+
+# Compiles to (logically):
+def Foo__sum(self: Ptr[Foo]) -> int32:
+    return self[0].x + self[0].y
+
+# Caller:
+def main() -> int32:
+    f: Foo
+    f.x = 3
+    f.y = 4
+    return f.sum()    # lowered: Foo__sum(&f)
+```
+
+Inside the method body, `self.field` reads/writes through the
+pointer (the codegen recognises `MemberExpr` whose base is `Ptr[T]`
+and loads the pointer value before adding the field offset). This
+is the same effect as the production `ptr[0].field` idiom, but
+spelled with auto-deref so methods read naturally.
+
+**Inheritance + methods.** Methods are inherited by the same
+field-flattening rule, with **first-match-wins** lookup at compile
+time: a child class's own methods shadow inherited ones; otherwise
+the leftmost base providing a method wins. The call site lowers to
+`<OwnerClass>__<method>`, where `OwnerClass` is the class that
+literally declared the method. For multi-base inheritance the
+receiver `&obj` is bumped by the owner-base's offset within the
+derived class (Adder's pointer arithmetic is un-scaled, so this is
+just `&obj + <byte offset>`).
+
+```python
+class Animal:
+    legs: int32
+
+    def kind(self) -> int32:
+        return 1
+
+    def num_legs(self) -> int32:
+        return self.legs
+
+class Dog(Animal):
+    breed: int32
+
+    def kind(self) -> int32:    # overrides Animal.kind
+        return 2
+
+def main() -> int32:
+    d: Dog
+    d.legs  = 4
+    d.breed = 7
+    return d.kind() * 10 + d.num_legs()    # 2*10 + 4 = 24
+```
+
+**`__init__` sugar.** If a class defines `def __init__(self, ...)`,
+the call shape `Foo(args...)` at the right-hand side of a `VarDecl`
+init OR a plain assignment is intercepted at codegen time and
+lowered to `Foo__init__(&target, args...)` against a
+stack-allocated local. Without `__init__`, `Foo(args)` is a compile
+error (the existing `f: Foo` declaration form continues to
+stack-allocate with zero-init).
+
+```python
+class Point:
+    x: int32
+    y: int32
+
+    def __init__(self, a: int32, b: int32) -> None:
+        self.x = a
+        self.y = b
+
+def main() -> int32:
+    p: Point = Point(3, 4)        # Point__init__(&p, 3, 4)
+    return p.x + p.y
+```
+
+**What's deliberately NOT here.** There is no vtable, no virtual /
+overridable dispatch, no destructors, no RAII, no mixins / multiple
+methods of the same name from different bases requiring MRO
+disambiguation (first-match-wins is the only rule), no decorators
+on methods (`@staticmethod`, `@classmethod`, `@property` all
+rejected at codegen time). For polymorphism use a `Fn[R, A...]`
+field — the existing `struct file_operations`-style dispatch table
+pattern, e.g. in `kernel/vfs/`.
 
 ---
 
@@ -952,7 +1056,8 @@ rejects it.
 | `try`/`except`/`raise`/`finally` | Exceptions break flow control, hide failure modes, don't compose with interrupt context. The hamsh shell language has them — Adder does not. | Return `int32` error codes (`-EINVAL`, `-ENOMEM`, `-ENOENT`, ...) — the Linux/Plan-9 convention. |
 | `with X as y:` context managers | RAII-ish but adds non-obvious cleanup paths. | Explicit cleanup before each return; or a single `defer`-style "goto fail" tail. |
 | `match`/`case` statements | The parser accepts the syntax, but codegen does not implement it. No production site uses it. | A chained `if`/`elif`. For wide dispatch on enum/syscall numbers, an `Array[N, Fn[...]]` jump table indexed by the value. |
-| Class methods (`def m(self):`) | Methods imply vtables or per-method name-mangling. Rejected at class-def time with an actionable error (commit 25e6657: used to be silently dropped). | A free function that takes a `Ptr[T]` as its first argument: `def my_method(self: Ptr[T], ...) -> R`. |
+| Virtual / overridable method dispatch (vtables) | Class methods exist (see *Static methods, auto-self, name mangling*) but they are STATIC — resolved at compile time to a `<Class>__<method>` symbol with first-match-wins shadowing. There is no vtable, no per-instance dispatch pointer, no runtime overrides. | Use a `Fn[R, A...]`-typed field on the class as a manual dispatch slot (the `struct file_operations` pattern). Fill it in at construction; call as `obj.handler(...)` lowered through the function-pointer indirect-call path. |
+| Destructors / RAII | No automatic cleanup at scope exit; no `def __del__`. Resource lifetime is explicit. | Match every `kmalloc` with an explicit `kfree`; structure error paths around a single trailing cleanup block (the `goto fail;` C idiom — Adder spells it as a flat list of releases before each return). |
 | Decorators on `def` / `class` (`@inline`, `@packed`, ...) | The codegen does not implement any decorator semantics. Rejected at codegen time with an actionable error (commit 25e6657: used to be silently dropped). | Define the class fields in the order and size you want; the codegen lays them out C-ABI style. For `@inline`-style hints there's no replacement — the compiler decides. |
 | `union` declarations | Parser accepts; codegen rejects at the source location with `x86: top-level UnionDef not yet supported`. Zero production usage. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
 | Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
