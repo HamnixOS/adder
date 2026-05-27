@@ -270,12 +270,17 @@ class X86CodeGen:
         self.percpu_size: int = 0
         self.structs: dict[str, StructInfo] = {}
         # Per-class method tables: class_methods[cls_name][method_name]
-        # = (owner_class_name, FunctionDef). owner is the class that
-        # literally declared the method; for inherited methods it
-        # differs from cls_name. First-match-wins: when a derived class
-        # redefines a parent's method, its FunctionDef replaces the
-        # parent's. Built in _collect_class_methods.
-        self.class_methods: dict[str, dict[str, tuple[str, "FunctionDef"]]] = {}
+        # = (owner_class_name, FunctionDef, receiver_offset). owner is
+        # the class that literally declared the method; for inherited
+        # methods it differs from cls_name. receiver_offset is the
+        # byte offset within cls_name at which the owner-class's
+        # layout begins — non-zero only for multi-base inheritance.
+        # First-match-wins: when a derived class redefines a parent's
+        # method, its FunctionDef replaces the parent's at offset 0.
+        # Built in _collect_class_methods.
+        self.class_methods: dict[
+            str, dict[str, tuple[str, "FunctionDef", int]]
+        ] = {}
         self.ctx: Optional[FunctionContext] = None
         # Bare-metal target compiles a standalone kernel ELF: skip
         # kbuild-specific bits like the .modinfo license stamp that modpost
@@ -584,7 +589,7 @@ class X86CodeGen:
                     # registered against the class that DECLARES them
                     # (which is the call-site's lookup answer), so we
                     # walk the resolved table not the literal decl list.
-                    for mname, (owner, mdef) in self.class_methods[
+                    for mname, (owner, mdef, _off) in self.class_methods[
                             decl.name].items():
                         # The owner-class symbol is emitted at owner's
                         # ClassDef pass below; here we just record the
@@ -667,14 +672,22 @@ class X86CodeGen:
         the override is resolved at compile time so the call site
         emits a direct `call <derived-class>__<method>`).
 
-        The (owner_class_name, FunctionDef) tuple records WHICH class
-        declared the method — call-site lowering uses owner to mangle
-        the symbol name. For an inherited method this means a derived
-        class's `obj.method()` lowers to `BaseClass__method(&obj)`,
-        not `DerivedClass__method` — that's correct because Adder's
-        inheritance is field-flattening at offset 0 and the base
-        method only references base-class fields, so `Ptr[Derived]`
-        is bit-identical to `Ptr[Base]` at offset 0.
+        Each entry is (owner_class_name, FunctionDef,
+        receiver_offset). owner names the class that literally
+        declared the method, FunctionDef is the body, and
+        receiver_offset is the byte offset within THIS class at which
+        the owner-class's layout starts.
+
+        For single inheritance (and the class's own methods)
+        receiver_offset is always 0 — Ptr[Derived] is bit-identical to
+        Ptr[Base] at offset 0 because field flattening prepends the
+        base's fields. For multi-base, the second-and-later bases
+        start at non-zero offsets (sizeof(prior bases)), so calling
+        an inherited method from one of those bases needs `&obj +
+        offset` as its receiver.
+
+        Requires self.structs to already be populated (so we can size
+        each base for offset computation). Call AFTER layout_struct.
         """
         # First pass: index ClassDefs by name for lookup.
         classes: dict[str, ClassDef] = {}
@@ -682,9 +695,37 @@ class X86CodeGen:
             if isinstance(decl, ClassDef):
                 classes[decl.name] = decl
 
+        def end_of_fields(cls_name: str) -> int:
+            """Return the offset just past `cls_name`'s last field,
+            mirroring layout_struct's per-field alignment walk WITHOUT
+            the trailing 8-byte round-up. This is the right "where
+            does the next adjacent struct start?" answer for placing
+            base classes during multi-base flattening — total_size
+            would over-count by up to 7 bytes because of the .bss
+            padding round-up.
+            """
+            cls = classes.get(cls_name)
+            if cls is None:
+                return 0
+            offset = 0
+            # Mirror layout_struct: walk bases first (depth-first), then
+            # own fields, aligning each field to its natural alignment.
+            def _walk_fields(c: ClassDef) -> None:
+                nonlocal offset
+                for b in c.bases:
+                    bc = classes.get(b)
+                    if bc is not None:
+                        _walk_fields(bc)
+                for f in c.fields:
+                    align = self.natural_align(f.field_type)
+                    offset = (offset + align - 1) & ~(align - 1)
+                    offset += self.get_type_size(f.field_type)
+            _walk_fields(cls)
+            return offset
+
         # Topological-ish walk: resolving a class's methods requires
         # its bases' tables to be ready. Recurse and memoise.
-        def resolve(name: str) -> dict[str, tuple[str, FunctionDef]]:
+        def resolve(name: str) -> dict[str, tuple[str, FunctionDef, int]]:
             if name in self.class_methods:
                 return self.class_methods[name]
             cls = classes.get(name)
@@ -693,17 +734,30 @@ class X86CodeGen:
                 # base resolution. Return empty; codegen aborts before
                 # this matters.
                 return {}
-            table: dict[str, tuple[str, FunctionDef]] = {}
+            table: dict[str, tuple[str, FunctionDef, int]] = {}
+            running_offset = 0
             for base in cls.bases:
                 # Bases listed left-to-right; later bases shadow
-                # earlier ones (Python MRO semantics flattened).
-                for mname, ent in resolve(base).items():
-                    table[mname] = ent
+                # earlier ones (Python MRO semantics flattened). Each
+                # base's inherited methods get their existing
+                # receiver_offset bumped by the running offset of this
+                # base within `cls`.
+                base_table = resolve(base)
+                for mname, (mowner, mdef, moff) in base_table.items():
+                    table[mname] = (mowner, mdef, running_offset + moff)
+                # Advance by base's actual flattened-field span (not
+                # the .bss-padded total_size — that would push the
+                # next base past where layout_struct actually placed
+                # its fields).
+                running_offset += end_of_fields(base)
             # Class's own methods override inherited ones (first-match
             # wins from the perspective of the resolved table the
-            # CHILD exposes).
+            # CHILD exposes). The class's own methods always sit at
+            # offset 0 — `self.field` in the method body addresses the
+            # class's full layout (which starts at offset 0 by
+            # definition).
             for m in cls.methods:
-                table[m.name] = (cls.name, m)
+                table[m.name] = (cls.name, m, 0)
             self.class_methods[name] = table
             return table
 
@@ -2363,30 +2417,50 @@ class X86CodeGen:
                 f"x86: class '{class_name}' has no method "
                 f"'{mc.method}' at {_span_location(span)}"
             )
-        owner, _mdef = table[mc.method]
+        owner, _mdef, receiver_offset = table[mc.method]
         sym = self._method_symbol(owner, mc.method)
 
         # Build the receiver expression. If obj is a Ptr[Class] the
         # pointer's value IS the receiver; otherwise we take its
-        # address.
+        # address. For multi-base inheritance where the owning base
+        # sits at a non-zero offset within the derived class, bump
+        # the pointer by that offset so the callee's self.field
+        # references (which use the owner's struct layout) land on
+        # the right bytes. For single inheritance receiver_offset==0
+        # and no bump is needed.
         from .ast_nodes import (
             CallExpr as _CallExpr,
             Identifier as _Identifier,
             UnaryExpr as _UnaryExpr,
+            BinaryExpr as _BinaryExpr,
+            IntLiteral as _IntLiteral,
+            CastExpr as _CastExpr,
         )
+        span = getattr(mc, "span", None)
         if is_ptr_receiver:
             receiver = mc.obj
         else:
-            receiver = _UnaryExpr(UnaryOp.ADDR, mc.obj, getattr(mc, "span", None))
+            receiver = _UnaryExpr(UnaryOp.ADDR, mc.obj, span)
+        if receiver_offset != 0:
+            # Pointer arithmetic in Adder is un-scaled (byte
+            # arithmetic) — just add the byte offset.
+            receiver = _BinaryExpr(
+                BinOp.ADD, receiver, _IntLiteral(receiver_offset, span), span
+            )
+            # Carry the pointer type through the cast so any further
+            # type inference on the receiver still works.
+            receiver = _CastExpr(
+                PointerType(Type(owner, span), span), receiver, span
+            )
 
         # Synthesise a CallExpr through the existing direct-call path.
         # `sym` is in self.defined_funcs (registered in Pass 1) so
         # gen_call emits a direct `call <sym>`.
         synth = _CallExpr(
-            _Identifier(sym, getattr(mc, "span", None)),
+            _Identifier(sym, span),
             [receiver] + list(mc.args),
             {},
-            getattr(mc, "span", None),
+            span,
         )
         self.gen_call(synth)
 
