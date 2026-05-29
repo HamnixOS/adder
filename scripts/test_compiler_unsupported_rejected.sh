@@ -80,12 +80,11 @@ CASES=(
     n: int32 = cast[int32](sizeof(int64))
     return 0
 "
-"for_loop|def main() -> int32:
-    s: int32 = 0
-    for i in range(10):
-        s = s + i
-    return s
-"
+# NOTE: `for ... in range(...)` / `for x in arr` ARE now implemented in
+# the x86_64 codegen — see scripts/test_compiler_for_loop.sh and
+# tests/test_compiler_for_loop.ad. They are intentionally NOT in this
+# rejected list anymore. `range(...)` remains valid ONLY as a for-loop
+# iterable; used as a first-class value it is still rejected (below).
 "range_builtin|def main() -> int32:
     n: int32 = cast[int32](range(5))
     return n

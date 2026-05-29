@@ -34,6 +34,7 @@ VERBOSE="${HAMNIX_COMPILER_TESTS_VERBOSE:-0}"
 # QEMU-boot fixtures take ~30-90s each.
 TESTS=(
     "lexer_test:python3 compiler/lexer_test.py"
+    "for_loop:bash scripts/test_compiler_for_loop.sh"
     "lex_digit_idents:bash scripts/test_lex_digit_idents.sh"
     "ptr_local:bash scripts/test_compiler_ptr_local.sh"
     "addr_of_nested:bash scripts/test_compiler_addr_of_nested.sh"

@@ -39,7 +39,7 @@ from .ast_nodes import (
     Program, FunctionDef, ExternDecl, Parameter,
     ClassDef, ClassField,
     VarDecl, Assignment, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
-    DoWhileStmt, BreakStmt, ContinueStmt, PassStmt,
+    DoWhileStmt, ForStmt, ForUnpackStmt, BreakStmt, ContinueStmt, PassStmt,
     Expr, Stmt,
     CallExpr, Identifier, StringLiteral, IntLiteral, CharLiteral, BoolLiteral,
     BinaryExpr, UnaryExpr, BinOp, UnaryOp,
@@ -194,9 +194,16 @@ class StructInfo:
 
 @dataclass
 class LoopContext:
-    """Tracks loop labels for future break/continue support."""
+    """Tracks loop labels for break/continue.
+
+    `continue` jumps to `continue_label`; `break` jumps to `end_label`.
+    For `while`/`do-while`, continue_label is the condition/cont target
+    (== start_label there). For `for` loops, continue_label is the
+    induction-step label so a `continue` still advances the counter —
+    matching Python's for-loop semantics — instead of skipping it."""
     start_label: str
     end_label: str
+    continue_label: str = ""
 
 
 @dataclass
@@ -230,8 +237,11 @@ class FunctionContext:
         self.label_counter += 1
         return f".{prefix}_{self.name}_{self.label_counter}"
 
-    def push_loop(self, start: str, end: str) -> None:
-        self.loop_stack.append(LoopContext(start, end))
+    def push_loop(self, start: str, end: str,
+                  continue_label: Optional[str] = None) -> None:
+        self.loop_stack.append(
+            LoopContext(start, end, continue_label or start)
+        )
 
     def pop_loop(self) -> None:
         self.loop_stack.pop()
@@ -1294,6 +1304,13 @@ class X86CodeGen:
                 if self._stmt_uses_addr_of_local(s):
                     return True
             return False
+        if isinstance(node, (ForStmt, ForUnpackStmt)):
+            if self._stmt_uses_addr_of_local(node.iterable):
+                return True
+            for s in node.body:
+                if self._stmt_uses_addr_of_local(s):
+                    return True
+            return False
         # Leaf / no-children Expr or Stmt: nothing to recurse into.
         return False
 
@@ -1324,7 +1341,7 @@ class X86CodeGen:
                     if self._stmt_has_big_array_local(s):
                         return True
             return False
-        if isinstance(node, (WhileStmt, DoWhileStmt)):
+        if isinstance(node, (WhileStmt, DoWhileStmt, ForStmt, ForUnpackStmt)):
             for s in node.body:
                 if self._stmt_has_big_array_local(s):
                     return True
@@ -1619,6 +1636,9 @@ class X86CodeGen:
             case DoWhileStmt(body=body, condition=cond):
                 self.gen_do_while(body, cond)
 
+            case ForStmt(var=var, iterable=iterable, body=body):
+                self.gen_for(var, iterable, body)
+
             case BreakStmt():
                 loop = self.ctx.current_loop()
                 if loop is None:
@@ -1629,7 +1649,7 @@ class X86CodeGen:
                 loop = self.ctx.current_loop()
                 if loop is None:
                     raise CodeGenError("x86: continue outside of loop")
-                self.emit(f"    jmp {loop.start_label}")
+                self.emit(f"    jmp {loop.continue_label}")
 
             case PassStmt():
                 self.emit("    # pass")
@@ -1820,6 +1840,180 @@ class X86CodeGen:
         self.gen_expr(cond)
         self.emit("    testq %rax, %rax")
         self.emit(f"    jnz {start_label}")
+        self.emit(f"{end_label}:")
+        self.ctx.pop_loop()
+
+    def _is_range_call(self, expr: Expr) -> bool:
+        """True if `expr` is a `range(...)` call used as an iterable."""
+        return (isinstance(expr, CallExpr)
+                and isinstance(expr.func, Identifier)
+                and expr.func.name == "range")
+
+    def _const_int_value(self, expr: Expr) -> Optional[int]:
+        """Compile-time integer value of `expr`, or None if non-constant.
+
+        Handles a bare `IntLiteral` and the `UnaryExpr(NEG, IntLiteral)`
+        the parser produces for a negative literal like `-1`. Used to
+        decide a constant range() step's loop direction at compile
+        time."""
+        if isinstance(expr, IntLiteral):
+            return expr.value
+        if isinstance(expr, UnaryExpr) and expr.op is UnaryOp.NEG:
+            inner = self._const_int_value(expr.operand)
+            return None if inner is None else -inner
+        return None
+
+    def gen_for(self, var: str, iterable: Expr, body: list[Stmt]) -> None:
+        """Lower a `for var in iterable:` loop to x86.
+
+        Two iterable shapes are supported (LANGUAGE.md "Control Flow →
+        Loops"):
+
+          * `range(stop)` / `range(start, stop)` / `range(start, stop,
+            step)` — an integer counter loop. The induction variable
+            walks [start, stop) by `step` (step defaults to 1).
+
+          * a fixed-size `Array[N, T]` value — `var` is bound to each
+            element in turn, index 0..N-1.
+
+        Both are lowered to the same scaffold as the hand-written
+        `while`-with-a-counter idiom they replace, so semantics match
+        exactly. `break` exits the loop; `continue` jumps to the
+        induction step (so the counter / index still advances — Python
+        for-loop semantics), NOT back to the condition test."""
+        if self._is_range_call(iterable):
+            self.gen_for_range(var, iterable, body)
+            return
+
+        it_type = self.get_expr_type(iterable)
+        if isinstance(it_type, ArrayType):
+            self.gen_for_array(var, iterable, it_type, body)
+            return
+
+        raise CodeGenError(
+            "x86: for-loops iterate `range(...)` or a fixed-size "
+            "Array[N, T]; got "
+            f"{type(iterable).__name__}"
+            + (f" of type {it_type.name}" if it_type is not None else "")
+        )
+
+    def gen_for_range(self, var: str, call: "CallExpr",
+                      body: list[Stmt]) -> None:
+        """`for var in range(...)` — integer counter loop."""
+        args = call.args
+        if len(args) == 1:
+            start_expr: Expr = IntLiteral(0)
+            stop_expr = args[0]
+            step_expr: Expr = IntLiteral(1)
+        elif len(args) == 2:
+            start_expr, stop_expr = args[0], args[1]
+            step_expr = IntLiteral(1)
+        elif len(args) == 3:
+            start_expr, stop_expr, step_expr = args[0], args[1], args[2]
+        else:
+            raise CodeGenError(
+                "x86: range() takes 1 to 3 arguments, got "
+                f"{len(args)}"
+            )
+
+        # Induction-variable type: prefer an annotated arg type, else the
+        # language default integer (int64). All ints live in a 64-bit
+        # slot so this only affects sized load/store + compare signedness.
+        loop_type = (self.get_expr_type(start_expr)
+                     or self.get_expr_type(stop_expr)
+                     or Type("int64"))
+
+        # Constant-step loops pick the compare direction at compile time:
+        # ascending (step > 0) tests `i < stop`; descending (step < 0)
+        # tests `i > stop`. A non-literal step is assumed ascending (the
+        # overwhelmingly common case) — matching the `while i < stop`
+        # idiom this replaces. A literal `0` step would spin forever; the
+        # lexer/parser surface a negative literal as UnaryExpr(NEG, ...),
+        # so _const_int_value sees through that.
+        const_step = self._const_int_value(step_expr)
+        if const_step == 0:
+            raise CodeGenError("x86: range() step must not be zero")
+        descending = const_step is not None and const_step < 0
+        cmp_op = BinOp.GT if descending else BinOp.LT
+
+        var_id = Identifier(var)
+        loop_var = self.ctx.alloc_local(
+            var, self.get_type_size(loop_type), loop_type
+        )
+
+        start_label = self.ctx.new_label("for")
+        step_label = self.ctx.new_label("for_step")
+        end_label = self.ctx.new_label("endfor")
+
+        # i = start
+        self.gen_expr(start_expr)
+        self._emit_local_store(loop_var, "%rax")
+
+        self.ctx.push_loop(start_label, end_label, continue_label=step_label)
+        self.emit(f"{start_label}:")
+        # while (i </> stop)
+        self.gen_expr(BinaryExpr(cmp_op, var_id, stop_expr))
+        self.emit("    testq %rax, %rax")
+        self.emit(f"    jz {end_label}")
+
+        for s in body:
+            self.gen_stmt(s)
+
+        # i = i + step  (continue lands here)
+        self.emit(f"{step_label}:")
+        self.gen_assignment(var_id, BinaryExpr(BinOp.ADD, var_id, step_expr),
+                            None)
+        self.emit(f"    jmp {start_label}")
+        self.emit(f"{end_label}:")
+        self.ctx.pop_loop()
+
+    def gen_for_array(self, var: str, iterable: Expr, arr_type: ArrayType,
+                      body: list[Stmt]) -> None:
+        """`for var in arr` over a fixed-size `Array[N, T]`.
+
+        Lowered with a hidden index counter walking 0..N-1; the loop
+        variable is re-bound to `arr[idx]` at the top of each iteration.
+        The loop variable is a private copy of the element (assigning to
+        it inside the body does NOT write back into the array), matching
+        Python's by-value binding for scalar element types."""
+        n = arr_type.size
+        elem_type = arr_type.element_type
+
+        idx_name = f"__for_idx_{self.ctx.label_counter}"
+        idx_var = self.ctx.alloc_local(idx_name, 8, Type("int64"))
+        idx_id = Identifier(idx_name)
+
+        loop_var = self.ctx.alloc_local(
+            var, self.get_type_size(elem_type), elem_type
+        )
+
+        start_label = self.ctx.new_label("forarr")
+        step_label = self.ctx.new_label("forarr_step")
+        end_label = self.ctx.new_label("endforarr")
+
+        # idx = 0
+        self.emit("    movq $0, %rax")
+        self._emit_local_store(idx_var, "%rax")
+
+        self.ctx.push_loop(start_label, end_label, continue_label=step_label)
+        self.emit(f"{start_label}:")
+        # while (idx < n)
+        self.gen_expr(BinaryExpr(BinOp.LT, idx_id, IntLiteral(n)))
+        self.emit("    testq %rax, %rax")
+        self.emit(f"    jz {end_label}")
+
+        # var = arr[idx]
+        self.gen_expr(IndexExpr(iterable, idx_id))
+        self._emit_local_store(loop_var, "%rax")
+
+        for s in body:
+            self.gen_stmt(s)
+
+        # idx = idx + 1  (continue lands here)
+        self.emit(f"{step_label}:")
+        self.gen_assignment(idx_id, BinaryExpr(BinOp.ADD, idx_id,
+                                               IntLiteral(1)), None)
+        self.emit(f"    jmp {start_label}")
         self.emit(f"{end_label}:")
         self.ctx.pop_loop()
 
