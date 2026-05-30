@@ -411,27 +411,44 @@ while i < 100:
     i = i + 1
 ```
 
-There is **no `for` statement at all** in Adder. The parser accepts
-the syntax (`for i in range(...)`) so error messages stay readable,
-but the codegen rejects `ForStmt` with `x86: statement ForStmt not
-yet supported`. There is also no `range()` builtin. Use a `while`
-loop with an explicit counter:
+Adder also has a **`for ... in` statement**. Two forms are lowered by
+the x86_64 codegen (both compile to the same counter/index scaffold the
+`while` idiom uses — no iterator-protocol or heap allocation):
 
 ```python
-# instead of:  for i in range(10): ...
-i: int32 = 0
-while i < 10:
+# Counter loop over range(). 1, 2 or 3 args, matching Python:
+#   range(stop)              -> 0, 1, ..., stop-1
+#   range(start, stop)       -> start, ..., stop-1
+#   range(start, stop, step) -> start, start+step, ... (excl. stop)
+for i in range(10):
     process(i)
-    i = i + 1
 
-# instead of:  for i in range(0, 100, 2): ...
-i: int32 = 0
-while i < 100:
+for i in range(0, 100, 2):
     flags = flags | (1 << i)
-    i = i + 2
+
+# A constant negative step counts down (the compare flips to `i > stop`);
+# a zero step is rejected at compile time.
+for i in range(10, 0, -1):
+    process(i)
 ```
 
-Equivalently for walking an array of length `n`:
+```python
+# Iterate a fixed-size array `Array[N, T]`. A hidden index walks 0..N-1
+# and the loop variable is rebound to a by-value copy of each element:
+xs: Array[4, int32] = [10, 20, 30, 40]
+total: int32 = 0
+for x in xs:
+    total = total + x
+```
+
+`break` and `continue` work inside `for` bodies with Python semantics:
+`continue` jumps to the induction step (so the counter/index still
+advances) and `break` exits the loop. The counter variable's type
+follows the surrounding annotation; `range()` is only valid as the
+iterable of a `for` (there is no first-class `range` value).
+
+The equivalent `while`-with-an-explicit-counter form remains valid and
+is still used throughout the tree:
 
 ```python
 i: int32 = 0
@@ -1082,7 +1099,6 @@ rejects it.
 
 | Feature | Status | Use instead |
 |---|---|---|
-| `for x in range(...)` / any `for ... in ...` | Codegen rejects `ForStmt`. No `range()` builtin. | `while` loop with an explicit counter. See *Control Flow → Loops*. |
 | Tuple-unpacking assignment (`a, b = b, a`) | Codegen rejects `TupleUnpackAssign`. | Use a temporary: `tmp = a; a = b; b = tmp`. |
 | Compound assignment (`+=`, `-=`, `*=`, `\|=`, `&=`, `^=`, `<<=`, `>>=`) | Codegen rejects with `x86: compound assignment '+=' not yet supported`. | Spell out: `x = x + 1`. |
 | `global x` / `nonlocal x` statements | Codegen rejects `GlobalStmt`. Not needed anyway — bare names that aren't locals resolve to globals automatically. | Write `counter = counter + 1` without a `global` declaration. |
